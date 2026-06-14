@@ -11,16 +11,22 @@ from kafka import KafkaConsumer
 BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
 FLINK_HOST = os.getenv("FLINK_JOBMANAGER_HOST", "flink-jobmanager")
 
-# Initialize session state for feature store and metrics
-if 'store' not in st.session_state:
-    st.session_state['store'] = {}
-if 'metrics' not in st.session_state:
-    st.session_state['metrics'] = {
-        "late_events_dropped": 0,
-        "latest_event_ts": 0,
-        "watermark": 0,
-        "watermark_lag": 0.0
+# 1. Global shared state cached across all sessions and reruns
+@st.cache_resource
+def get_global_state():
+    return {
+        "store": {},
+        "metrics": {
+            "late_events_dropped": 0,
+            "latest_event_ts": 0,
+            "watermark": 0,
+            "watermark_lag": 0.0
+        }
     }
+
+global_state = get_global_state()
+GLOBAL_STORE = global_state["store"]
+GLOBAL_METRICS = global_state["metrics"]
 
 # Thread 1: Consume computed features from the feature-store topic
 def feature_listener():
@@ -36,9 +42,9 @@ def feature_listener():
             entity_id = val.get("entity_id")
             feat_name = val.get("feature_name")
             if entity_id and feat_name:
-                if entity_id not in st.session_state['store']:
-                    st.session_state['store'][entity_id] = {}
-                st.session_state['store'][entity_id][feat_name] = {
+                if entity_id not in GLOBAL_STORE:
+                    GLOBAL_STORE[entity_id] = {}
+                GLOBAL_STORE[entity_id][feat_name] = {
                     "value": val.get("feature_value"),
                     "computed_at": val.get("computed_at"),
                     "received_at": time.time()
@@ -62,8 +68,8 @@ def user_events_listener():
                 try:
                     dt = datetime.strptime(ts_str, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
                     ts_ms = int(dt.timestamp() * 1000)
-                    if ts_ms > st.session_state['metrics']['latest_event_ts']:
-                        st.session_state['metrics']['latest_event_ts'] = ts_ms
+                    if ts_ms > GLOBAL_METRICS['latest_event_ts']:
+                        GLOBAL_METRICS['latest_event_ts'] = ts_ms
                 except Exception as e:
                     pass
     except Exception as e:
@@ -107,27 +113,30 @@ def flink_metrics_listener():
                             if val > max_watermark:
                                 max_watermark = val
                                 
-                st.session_state['metrics']['late_events_dropped'] = int(total_late)
+                GLOBAL_METRICS['late_events_dropped'] = int(total_late)
                 if max_watermark > 0:
-                    st.session_state['metrics']['watermark'] = max_watermark
+                    GLOBAL_METRICS['watermark'] = max_watermark
                     
-                    latest_et = st.session_state['metrics']['latest_event_ts']
+                    latest_et = GLOBAL_METRICS['latest_event_ts']
                     if latest_et > 0:
                         # Watermark lag is the difference between latest event-time and latest watermark
-                        st.session_state['metrics']['watermark_lag'] = max(0.0, (latest_et - max_watermark) / 1000.0)
+                        GLOBAL_METRICS['watermark_lag'] = max(0.0, (latest_et - max_watermark) / 1000.0)
         except Exception as e:
             pass
         time.sleep(1)
 
-# Start background listener threads
-if 'threads_started' not in st.session_state:
+# 2. Start background listener threads exactly once across server lifetime
+@st.cache_resource
+def start_threads():
     t1 = threading.Thread(target=feature_listener, daemon=True)
     t1.start()
     t2 = threading.Thread(target=user_events_listener, daemon=True)
     t2.start()
     t3 = threading.Thread(target=flink_metrics_listener, daemon=True)
     t3.start()
-    st.session_state['threads_started'] = True
+    return True
+
+start_threads()
 
 # Main Streamlit UI layout
 st.set_page_config(page_title="Real-Time ML Feature Pipeline Dashboard", layout="wide")
@@ -147,7 +156,7 @@ engagement_rate_freshness = "N/A"
 latest_click_time = 0
 latest_engage_time = 0
 
-for ent_id, feats in st.session_state['store'].items():
+for ent_id, feats in GLOBAL_STORE.items():
     if 'click_rate' in feats:
         latest_click_time = max(latest_click_time, feats['click_rate']['received_at'])
     if 'engagement_rate' in feats:
@@ -163,9 +172,9 @@ with col1:
 with col2:
     st.metric(label="Engagement Rate Freshness", value=engagement_rate_freshness)
 with col3:
-    st.metric(label="Late Events Dropped Counter", value=st.session_state['metrics']['late_events_dropped'])
+    st.metric(label="Late Events Dropped Counter", value=GLOBAL_METRICS['late_events_dropped'])
 with col4:
-    lag_val = st.session_state['metrics']['watermark_lag']
+    lag_val = GLOBAL_METRICS['watermark_lag']
     st.metric(label="Current Watermark Lag", value=f"{round(lag_val, 1)}s lag" if lag_val > 0 else "0s")
 
 st.markdown("---")
@@ -174,8 +183,8 @@ st.markdown("---")
 st.subheader("🔍 Real-time Entity Feature Lookup")
 search_id = st.text_input("Enter Target Entity ID (User ID or Content ID):", value="user_alpha")
 
-if search_id in st.session_state['store']:
-    entity_data = st.session_state['store'][search_id]
+if search_id in GLOBAL_STORE:
+    entity_data = GLOBAL_STORE[search_id]
     rows = []
     for f_name, f_info in entity_data.items():
         try:
